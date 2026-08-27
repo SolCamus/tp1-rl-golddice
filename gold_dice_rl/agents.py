@@ -1,4 +1,5 @@
 import numpy as np
+from config import get_new_dice_cost, get_upgrade_cost, SHIELD_COST, STORE_DIE_COST
 
 from config import (
     HORIZON,
@@ -66,3 +67,42 @@ class SimpleExpectancyAgent:
                 best_action = UPGRADE
 
         return best_action, None
+
+
+class QLearningAgent:
+    def __init__(self, q_table_path=None):
+        self.Q = {}
+        if q_table_path is not None:
+            import pickle
+            with open(q_table_path, "rb") as f:
+                self.Q = pickle.load(f)
+
+    def discretize_state(self, obs):
+        gold = obs["gold"]
+        can_afford_dice = int(gold >= get_new_dice_cost(obs["num_dice"]))
+        can_afford_upgrade = int(gold >= get_upgrade_cost(obs["dice_bonus"]))
+        can_afford_shield = int(gold >= SHIELD_COST)
+        can_afford_store = int(gold >= STORE_DIE_COST)
+
+        turn_phase = min(obs["turn"] // 10, 2)
+        dice_bin = min(obs["num_dice"], 5)
+        bonus_bin = min(obs["dice_bonus"], 4)
+        shield_bin = min(obs["shields"], 2)
+        stored_bin = int(obs["stored_value"] > 0)
+        roll_max_bin = obs["roll_max"]
+
+        return (
+            turn_phase, can_afford_dice, can_afford_upgrade,
+            can_afford_shield, can_afford_store,
+            dice_bin, bonus_bin, shield_bin, stored_bin, roll_max_bin,
+        )
+
+    def act(self, obs, env):
+        state = self.discretize_state(obs)
+        valid_actions = env.get_valid_actions()
+        q_values = {a: self.Q.get((state, a), 0.0) for a in valid_actions}
+        best_action = max(q_values, key=q_values.get)
+        score_amount = None
+        if best_action == SCORE:
+            score_amount = obs["gold"]  # placeholder, todavía pendiente
+        return best_action, score_amount
