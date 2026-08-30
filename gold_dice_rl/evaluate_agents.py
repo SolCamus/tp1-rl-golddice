@@ -1,7 +1,7 @@
 import numpy as np
 
 from env import GoldDiceEnv
-from agents import RandomLegalAgent, SimpleExpectancyAgent
+from agents import RandomLegalAgent, SimpleExpectancyAgent, QLearningAgent
 
 
 def evaluate(agent, n_episodes=1000, seed=0, obs_mode="dict"):
@@ -35,6 +35,7 @@ if __name__ == "__main__":
     agents = {
         "RandomLegal": RandomLegalAgent(seed=123),
         "SimpleExpectancy": SimpleExpectancyAgent(),
+        "QLearning": QLearningAgent("q_table.pkl"),
     }
 
     for name, agent in agents.items():

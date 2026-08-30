@@ -66,3 +66,33 @@ class SimpleExpectancyAgent:
                 best_action = UPGRADE
 
         return best_action, None
+
+
+class QLearningAgent:
+    """
+    Agente entrenado con Q-Learning tabular off-policy (ver train_qlearning.py
+    para el detalle del entrenamiento: discretizacion de estado, exploracion
+    guiada por SimpleExpectancyAgent + epsilon-greedy, y reward shaping por
+    potencial).
+
+    Carga una tabla Q ya entrenada (q_table.pkl, generada por
+    train_qlearning.py) y la usa para decidir en cada turno. Si el estado no
+    fue visitado durante el entrenamiento (posible dado que el oro no esta
+    acotado), cae de forma segura en la heuristica SimpleExpectancyAgent en
+    vez de tomar una accion arbitraria.
+    """
+
+    def __init__(self, q_table_path="q_table.pkl"):
+        import pickle
+        from train_qlearning import select_action, tabular_action_to_env
+
+        with open(q_table_path, "rb") as f:
+            self.Q = pickle.load(f)
+
+        self._select_action = select_action
+        self._tabular_action_to_env = tabular_action_to_env
+        self._fallback = SimpleExpectancyAgent()
+
+    def act(self, obs, env):
+        tabular_action = self._select_action(self.Q, obs, env, expert_fallback=self._fallback)
+        return self._tabular_action_to_env(tabular_action, env.gold)
