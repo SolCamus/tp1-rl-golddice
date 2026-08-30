@@ -7,7 +7,7 @@ from agents import QLearningAgent, SCORE_FRACTIONS
 
 
 # ---- Hiperparámetros ----
-N_EPISODES = 1_000_000
+N_EPISODES = 1_500_000
 ALPHA = 0.075       # tasa de aprendizaje
 GAMMA = 0.99        # factor de descuento
 EPS_START = 1.0     # exploración inicial (100% al azar)
@@ -22,15 +22,18 @@ def epsilon_by_episode(ep):
     frac = min(ep / EPS_DECAY_EPISODES, 1.0)
     return EPS_START + frac * (EPS_END - EPS_START)
 
-
-INVEST_BONUS_MAX = 30.0
+DICE_BONUS_MAX = 50.0     # bonus para BUY_DICE
+UPGRADE_BONUS_MAX = 20.0  # bonus para UPGRADE 
 
 def shaped_reward(env_reward, internal_action, obs):
-    """Reward real + bonus por invertir, mayor cuanto mas turnos quedan por delante."""
     bonus = 0.0
-    if internal_action in (BUY_DICE, UPGRADE):
-        turns_left = HORIZON - obs["turn"]
-        bonus = INVEST_BONUS_MAX * (turns_left / HORIZON)
+    turns_left = HORIZON - obs["turn"]
+    fraction = turns_left / HORIZON
+
+    if internal_action == BUY_DICE:
+        bonus = DICE_BONUS_MAX * fraction
+    elif internal_action == UPGRADE:
+        bonus = UPGRADE_BONUS_MAX * fraction * obs["num_dice"]
     return env_reward + bonus
 
 def choose_action(agent, obs, env, epsilon, rng):
