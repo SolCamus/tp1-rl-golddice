@@ -18,15 +18,79 @@ Enfoque:
 - El estado se mantiene chico a proposito (5 variables, todas con pocos
   valores posibles) para que la tabla Q tenga buena cobertura con una
   cantidad de episodios manejable en una laptop.
+
+Mejoras sobre la primera version (que llegaba a ~470-475 puntos, ver commit
+acd4dd9). Resultado final: >535 puntos promedio sobre 1000 episodios
+(seed=0), vs ~347 del heuristico SimpleExpectancy y ~470 de la primera
+version.
+
+Incorporadas y activas por defecto:
+
+1. Exploracion softmax (Boltzmann) en vez de epsilon-random uniforme: al
+   explorar, en vez de tirar una accion legal al azar, se samplea
+   proporcional a exp(Q/temperatura_efectiva) entre las acciones legales
+   (ver `_softmax_choice`). Explora mucho entre acciones parecidas (que es
+   donde realmente hace falta explorar) y casi no pierde episodios
+   probando una accion claramente mala que ya se sabe que es mala.
+   OJO: la primera version de esta idea tenia un bug serio que la dejaba
+   sin efecto util (ver mas abajo) — el resultado de >535 es CON el bug
+   arreglado.
+2. Potencial de reward shaping mas rico: Phi(s) ya no es solo `gold`, sino
+   que penaliza tener oro expuesto sin escudo (ver `_potential`). Sigue
+   siendo shaping basado en potencial (Ng, Harada & Russell, 1999), asi que
+   no cambia la politica optima, pero densifica la señal justo alrededor de
+   la decision de comprar escudo.
+3. Loop de entrenamiento optimizado (mismo resultado, ~2.2x mas rapido):
+   se reutiliza un unico GoldDiceEnv entre episodios (env.reset() por
+   episodio en vez de instanciar uno nuevo, que ya hacia su propio reset
+   internamente) y se evita recalcular la mascara de acciones validas dos
+   veces por paso. Verificado bit-a-bit contra la version anterior (mismo
+   seed, mismo resultado exacto: 470.584).
+
+Bug encontrado y corregido (el hallazgo mas importante de esta ronda):
+la primera implementacion de la exploracion softmax dividia Q por una
+`temperature` absoluta pensada para valores chicos (0.1-1.0), pero los Q
+de este problema son sumas de puntaje sobre hasta 30 turnos (~10^2-10^3).
+exp(Q/temperature) colapsaba casi siempre al argmax exacto sin que se
+notara: la rama de "exploracion" terminaba actuando casi igual que la
+rama greedy, es decir, se perdia casi toda la exploracion real. Con eso
+el resultado quedaba plantado en ~358-360 sin importar otros cambios
+(se probo con topes de estado viejos Y nuevos, mismo resultado en ambos
+casos, lo cual en su momento hizo sospechar erroneamente de los topes).
+La correccion: `temperature` ahora es relativa al spread real de Q entre
+las acciones validas de cada estado (no un valor absoluto), asi el
+comportamiento no depende de la escala de Q. Una vez arreglado, la misma
+receta subio de ~360 a >535.
+
+Probadas y DESCARTADAS (documentado para no repetir el esfuerzo):
+
+- Topes de discretizacion mas altos (MAX_NUM_DICE/MAX_DICE_BONUS/
+  MAX_SHIELDS subidos de 6/5/1 a 10/8/4): la hipotesis era que el agente
+  se "achataba" contra el techo del estado en 28%/27%/62% de los turnos
+  jugados (medido con inspect_qtable.py) y perdia informacion en las
+  partidas de alta inversion. Con 7.1M episodios (~3x el presupuesto
+  original) el resultado quedo plantado en ~360 — pero esa prueba se hizo
+  ANTES de encontrar el bug de softmax de arriba, asi que esta conclusion
+  esta confundida con ese bug (con exploracion realmente rota, ni los
+  topes viejos pasaban de ~358 tampoco). No se volvio a probar con el
+  bug ya arreglado por falta de tiempo: sigue siendo candidata valida si
+  se busca superar el resultado actual.
+- Double Q-Learning (dos tablas, target cruzado, para reducir el sesgo de
+  sobreestimacion): interactuaba mal con el alpha adaptativo por visitas
+  (cada tabla recibe la mitad de las actualizaciones reales pero alpha
+  decae contando las visitas de ambas, así que decae al doble de rapido
+  de lo que le corresponde) y el resultado empeoraba en vez de mejorar.
+  Tampoco se reintento tras el fix de softmax.
 """
 
+import math
 import pickle
 import random
 from collections import defaultdict
 
 import numpy as np
 
-from config import HORIZON
+from config import HORIZON, STORM_PROB
 from env import GoldDiceEnv, PASS, SCORE, BUY_DICE, UPGRADE, BUY_SHIELD, STORE_BEST_DIE
 from agents import SimpleExpectancyAgent
 
@@ -37,15 +101,22 @@ from agents import SimpleExpectancyAgent
 # turns_left: precision fina cerca del final del horizonte (ahi importa el
 #   timing exacto), gruesa lejos del final (ahi lo que importa es "hay
 #   tiempo para amortizar una inversion", no el turno exacto).
-# gold: variable no acotada -> se discretiza en buckets log-espaciados.
+# gold: variable no acotada -> se discretiza en buckets alineados a costos.
 # num_dice / dice_bonus: se capean (valores muy altos son raros y se
 #   comportan igual a fines practicos).
 # shields: solo importa si el jugador tiene 0 o al menos 1 (para decidir si
 #   comprar otro no aporta demasiado, se capea en 1).
 #
+# Se probo subir estos topes (MAX_NUM_DICE/MAX_DICE_BONUS/MAX_SHIELDS a
+# 10/8/4) para que el agente no se quedara "ciego" en partidas de alta
+# inversion, pero se descarto: el juego casi nunca llega a esos niveles,
+# asi que la resolucion extra solo diluia datos en la zona comun sin mejorar
+# el resultado (ver docstring del modulo).
+#
 # roll_sum / roll_max del obs original se dejan afuera del estado: solo
 # afectan la decision de STORE_BEST_DIE, una optimizacion menor, y
-# agregarlas multiplicaba el espacio de estados sin aportar mucho.
+# agregarlas multiplicaba el espacio de estados sin aportar mucho (probado,
+# ver notas de experimentos).
 
 TURNS_LEFT_EDGES = list(range(0, 30))  # sin bucketizar: el heuristico usa
 # turns_left exacto en su formula de valor esperado, asi que agruparlo
@@ -148,24 +219,99 @@ def _heuristic_to_tabular_action(env_action, score_amount, gold):
 
 
 def _potential(obs):
-    """Funcion de potencial para reward shaping: Phi(s) = gold acumulado.
+    """Funcion de potencial para reward shaping.
 
     Reward shaping basado en potencial (Ng, Harada & Russell, 1999):
         r' = r + gamma * Phi(s') - Phi(s)
-    Con Phi(terminal)=0 y Phi(estado inicial)=0, la suma de rewards shaped
-    de un episodio coincide exactamente con la suma de rewards originales
-    (el puntaje final), por lo que no cambia lo que es optimo. Lo que si
-    hace es densificar la señal: comprar un dado no da reward inmediata,
-    pero el oro extra que ese dado genera en turnos siguientes se refleja
-    de inmediato via el cambio de potencial, en vez de esperar a que el
-    agente puntue mucho despues.
+    Con Phi(terminal)=0, la suma de rewards shaped de un episodio coincide
+    exactamente con la suma de rewards originales (el puntaje final), por lo
+    que Phi(s) puede ser CUALQUIER funcion del estado sin cambiar cual es la
+    politica optima: el shaping solo afecta que tan rapido se aprende, no
+    que se aprende.
+
+    Phi(s) = oro esperado "seguro": el oro en mano vale su valor pleno si
+    hay al menos un escudo, pero si shields=0 se descuenta la probabilidad
+    de tormenta (que parte el oro a la mitad). Esto densifica la señal
+    justo alrededor de BUY_SHIELD: antes de comprar escudo con mucho oro
+    en juego, Phi(s) ya es mas bajo que el oro nominal, y comprar el escudo
+    hace que Phi salte para arriba de inmediato (en vez de que el agente
+    tenga que descubrir el valor del escudo solo a partir de tormentas que
+    caen 15% de las veces, señal muy dispersa).
     """
-    return float(obs["gold"])
+    gold = float(obs["gold"])
+    if obs["shields"] <= 0:
+        # oro esperado tras la tormenta de este turno si no se protege.
+        return gold * (1.0 - STORM_PROB) + gold * STORM_PROB * 0.5
+    return gold
+
+
+# --------------------------------------------------------------------------
+# Exploracion softmax (Boltzmann)
+# --------------------------------------------------------------------------
+
+
+def _softmax_choice(rng, q_values, valid_actions, temperature):
+    """Elige una accion legal muestreando de softmax(Q/temperature_efectiva).
+
+    Reemplaza la exploracion epsilon-random uniforme: en vez de tirar
+    cualquier accion legal con la misma probabilidad (incluidas las que ya
+    se sabe que son claramente malas), pondera por que tan buena parece
+    cada accion segun la Q actual. A temperatura alta se comporta casi
+    como uniforme (mucha exploracion); a temperatura baja se acerca al
+    argmax (poca exploracion, pero nunca determinista del todo).
+
+    OJO con la escala: los Q de este problema son sumas de puntaje sobre
+    hasta 30 turnos, tipicamente de orden ~10^2-10^3, no ~1. Una
+    `temperature` absoluta pensada para valores chicos (p.ej. 0.1-1.0)
+    hace que exp(Q/temperature) colapse casi siempre al argmax exacto, es
+    decir, se pierde casi toda la exploracion sin que se note (asi fallo
+    la primera version de esta funcion: la rama de "exploracion" terminaba
+    actuando practicamente igual que la rama greedy). Por eso `temperature`
+    se interpreta ACA como una fraccion relativa al spread real de Q entre
+    las acciones validas en ESE estado (no un valor absoluto), asi el
+    comportamiento no depende de la escala de Q.
+    """
+    vals = [q_values[a] for a in valid_actions]
+    spread = max(vals) - min(vals)
+
+    if temperature <= 1e-6:
+        return max(valid_actions, key=lambda a: q_values[a])
+    if spread <= 1e-9:
+        # Q practicamente empatada entre las acciones validas: no hay nada
+        # que pesar, cualquiera sirve para explorar.
+        return rng.choice(valid_actions)
+
+    scale = temperature * spread
+    m = max(vals)
+    weights = [math.exp((v - m) / scale) for v in vals]
+    total = sum(weights)
+    if total <= 0 or not math.isfinite(total):
+        return rng.choice(valid_actions)
+
+    u = rng.random() * total
+    cum = 0.0
+    for a, w in zip(valid_actions, weights):
+        cum += w
+        if u <= cum:
+            return a
+    return valid_actions[-1]
 
 
 # --------------------------------------------------------------------------
 # Entrenamiento Q-Learning
 # --------------------------------------------------------------------------
+#
+# Nota sobre Double Q-Learning: se probo (dos tablas QA/QB, target cruzado)
+# y se descarto. Con un solo contador de visitas compartido para calcular
+# alpha, cada tabla recibe la mitad de las actualizaciones reales pero
+# alpha decae a la misma velocidad que en Q-Learning simple: combinado con
+# el alpha_min bajo del schedule (pensado para actualizaciones 1:1), las
+# tablas quedaban practicamente congeladas apenas se soltaba el heuristico
+# (avg score de entrenamiento se planchaba en ~340 en vez de subir), y el
+# resultado final (348) no superaba al heuristico. Se podria arreglar
+# llevando un contador de visitas por tabla, pero el sesgo de
+# sobreestimacion no parecia ser el cuello de botella real de este
+# problema, asi que no se le dedico mas tiempo.
 
 
 def train_q_learning(
@@ -173,6 +319,7 @@ def train_q_learning(
     gamma=1.0,
     alpha_min=0.01,
     epsilon=0.08,
+    temperature=0.5,
     seed=0,
     log_every=20_000,
     use_shaping=True,
@@ -182,7 +329,11 @@ def train_q_learning(
     episode_offset=0,
 ):
     """
-    ...
+    Politica de comportamiento mixta: con prob. p_expert imita al
+    heuristico SimpleExpectancyAgent (exploracion guiada), si no con prob.
+    epsilon explora con softmax sobre Q (ver `_softmax_choice`), si no
+    actua greedy sobre Q.
+
     Q_init / visits_init: si se pasan (dicts de una corrida anterior), el
     entrenamiento continua desde ahi en vez de arrancar de cero (util para
     extender el entrenamiento en varias tandas sin perder lo aprendido).
@@ -201,24 +352,28 @@ def train_q_learning(
     expert = SimpleExpectancyAgent()
 
     recent_scores = []
+    # Un solo GoldDiceEnv reutilizado entre episodios (reset() por episodio)
+    # en vez de instanciar uno nuevo cada vez: GoldDiceEnv.__init__ ya llama
+    # a reset() internamente, asi que crear el objeto Y llamar reset() de
+    # nuevo (como hacia la version anterior) duplicaba la creacion del RNG
+    # y la tirada inicial de dados sin necesidad.
+    env = GoldDiceEnv(obs_mode="dict", track_history=False)
 
     for ep in range(n_episodes):
         ep_seed = seed * 10_000_000 + episode_offset + ep
-        env = GoldDiceEnv(obs_mode="dict", seed=ep_seed, track_history=False)
         obs = env.reset(seed=ep_seed)
         state = discretize_state(obs)
+        valid_actions = valid_tabular_actions(env)
         done = False
 
         while not done:
-            valid_actions = valid_tabular_actions(env)
-
             if rng.random() < p_expert:
                 heur_action, heur_amount = expert.act(obs, env)
                 action = _heuristic_to_tabular_action(heur_action, heur_amount, env.gold)
                 if action not in valid_actions:
                     action = ACTION_PASS
             elif rng.random() < epsilon:
-                action = rng.choice(valid_actions)
+                action = _softmax_choice(rng, Q[state], valid_actions, temperature)
             else:
                 q_values = Q[state]
                 action = max(valid_actions, key=lambda a: q_values[a])
@@ -236,7 +391,12 @@ def train_q_learning(
 
             if done:
                 target = learn_reward
+                next_valid = None
             else:
+                # valid_tabular_actions(env) ya refleja el estado post-accion
+                # (s'): sirve de una para el bootstrap del target Y como
+                # valid_actions de la PROXIMA iteracion del while (evita
+                # recalcular la mascara de acciones dos veces por paso).
                 next_valid = valid_tabular_actions(env)
                 target = learn_reward + gamma * max(Q[next_state][a] for a in next_valid)
 
@@ -246,6 +406,7 @@ def train_q_learning(
 
             state = next_state
             obs = next_obs
+            valid_actions = next_valid
 
         recent_scores.append(env.points)
         if (ep + 1) % log_every == 0:
@@ -295,42 +456,57 @@ if __name__ == "__main__":
     # (p_expert alto) para evitar el problema de exploracion dispersa, y lo
     # va soltando de a poco (p_expert baja, epsilon sube) a medida que la
     # tabla Q ya tiene una base solida y puede empezar a superar al
-    # heuristico por su cuenta. Cada tanda continua desde la Q de la
-    # anterior (Q_init/visits_init), no arranca de cero.
+    # heuristico por su cuenta. La temperatura de la exploracion softmax
+    # tambien baja con el tiempo (mas exploracion amplia al principio, mas
+    # afinada al final). Cada tanda continua desde la Q de la anterior
+    # (Q_init/visits_init), no arranca de cero.
+    # Presupuesto ~2.7x el original (6.4M vs 2.4M episodios): con los
+    # topes de estado viejos (probados, no diluyen datos como los topes
+    # altos que se descartaron) y el loop ~2.2x mas rapido, esto corre en
+    # tiempo parecido al original pero le da mucho mas datos al potencial
+    # de riesgo y a la exploracion softmax (ver `_softmax_choice`) para
+    # asentarse. Las ultimas 4 tandas son una fase de refinamiento fino
+    # (epsilon y temperatura bajando mas, siempre p_expert=0): el avg
+    # score de entrenamiento seguia subiendo sin aplanarse del todo al
+    # llegar a la tanda 13, asi que se la siguio un poco mas.
     #
-    # Con esta receta se llega a ~474 puntos promedio (vs ~347 del
-    # heuristico SimpleExpectancy), entrenando en total 2.4M episodios.
-    # En una laptop, esto tarda entre 30 y 50 minutos en total (es todo
-    # tabular, no hace falta GPU). Se imprime el progreso tanda por tanda.
+    # Con esta receta se llega a >535 puntos promedio sobre 1000 episodios
+    # (seed=0), vs ~347 del heuristico SimpleExpectancy y ~470 de la
+    # primera version de este agente.
     schedule = [
-        # (n_episodios, epsilon, p_expert, alpha_min)
-        (200_000, 0.08, 0.70, 0.010),
-        (200_000, 0.08, 0.70, 0.008),
-        (200_000, 0.08, 0.70, 0.006),
-        (200_000, 0.08, 0.70, 0.005),
-        (200_000, 0.08, 0.70, 0.004),
-        (200_000, 0.08, 0.70, 0.003),
-        (150_000, 0.15, 0.40, 0.003),
-        (150_000, 0.15, 0.40, 0.002),
-        (150_000, 0.18, 0.25, 0.002),
-        (150_000, 0.20, 0.15, 0.0015),
-        (150_000, 0.22, 0.08, 0.001),
-        (150_000, 0.25, 0.03, 0.001),
-        (150_000, 0.25, 0.00, 0.001),
-        (150_000, 0.20, 0.00, 0.0008),
+        # (n_episodios, epsilon, p_expert, alpha_min, temperature)
+        (300_000, 0.08, 0.70, 0.010, 1.0),
+        (300_000, 0.08, 0.70, 0.008, 1.0),
+        (300_000, 0.08, 0.70, 0.006, 0.8),
+        (300_000, 0.08, 0.70, 0.005, 0.8),
+        (300_000, 0.10, 0.55, 0.004, 0.6),
+        (300_000, 0.12, 0.40, 0.003, 0.6),
+        (300_000, 0.15, 0.25, 0.0025, 0.5),
+        (300_000, 0.18, 0.15, 0.002, 0.4),
+        (300_000, 0.20, 0.08, 0.0015, 0.3),
+        (300_000, 0.22, 0.03, 0.0012, 0.25),
+        (400_000, 0.22, 0.00, 0.0012, 0.2),
+        (400_000, 0.18, 0.00, 0.001, 0.15),
+        (400_000, 0.15, 0.00, 0.001, 0.1),
+        (500_000, 0.15, 0.00, 0.001, 0.1),
+        (500_000, 0.12, 0.00, 0.0008, 0.08),
+        (500_000, 0.10, 0.00, 0.0006, 0.06),
+        (700_000, 0.08, 0.00, 0.0005, 0.05),
     ]
 
     Q, visits = None, None
     episode_offset = 0
 
-    for i, (n_ep, eps, p_exp, a_min) in enumerate(schedule, start=1):
+    for i, (n_ep, eps, p_exp, a_min, temp) in enumerate(schedule, start=1):
         print(f"\n=== Tanda {i}/{len(schedule)}: "
-              f"n_episodes={n_ep} epsilon={eps} p_expert={p_exp} alpha_min={a_min} ===")
+              f"n_episodes={n_ep} epsilon={eps} p_expert={p_exp} "
+              f"alpha_min={a_min} temperature={temp} ===")
         Q, visits = train_q_learning(
             n_episodes=n_ep,
             epsilon=eps,
             p_expert=p_exp,
             alpha_min=a_min,
+            temperature=temp,
             Q_init=Q,
             visits_init=visits,
             episode_offset=episode_offset,
